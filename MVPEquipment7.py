@@ -8,9 +8,10 @@ from werkzeug.utils import secure_filename
 import librosa
 import torch
 from torch import nn, optim
-from torchopenl3 import get_openl3_embedding  # Требует установки: pip install torchopenl3
+from torchopenl3 import get_openl3_embedding
 import logging
 from pathlib import Path
+import requests
 
 app = Flask(__name__)
 
@@ -68,8 +69,8 @@ def find_similar_sounds(new_embedding, db, top_n=5):
     similarities = []
     for key, data in db.items():
         emb = np.array(data["embedding"])
-        category = data.get("category", "unknown")  # Категория по умолчанию
-        sim = np.dot(new_embedding, emb) / (np.linalg.norm(new_embedding) * np.linalg.norm(emb))  # Косинусное сходство
+        category = data.get("category", "unknown")
+        sim = np.dot(new_embedding, emb) / (np.linalg.norm(new_embedding) * np.linalg.norm(emb))
         similarities.append((key, sim, category))
     similarities.sort(key=lambda x: x[1], reverse=True)
     return [{"file": key, "similarity": sim, "category": category} for key, sim, category in similarities[:top_n]]
@@ -84,7 +85,7 @@ def train_model(db):
         if cat in categories:
             X.append(torch.tensor(data["embedding"], dtype=torch.float32))
             y.append(categories[cat])
-    if len(X) < 3:  # Минимальное количество образцов для обучения
+    if len(X) < 3:
         logger.info("Not enough data to train model")
         return
     X = torch.stack(X)
@@ -115,43 +116,74 @@ def determine_status(similar_sounds, threshold=0.8):
     else:
         return "Не удалось определить статус (низкое сходство или смешанные категории)"
 
-def populate_embeddings_db(audio_folder, category_map=None):
-    """Заполнение базы эмбеддингов из датасета с учетом структуры папок."""
+def download_file_from_github(repo_url, file_path, local_path):
+    """Скачивание файла из репозитория GitHub."""
+    raw_url = f"{repo_url}/raw/main/{file_path}"
+    response = requests.get(raw_url)
+    if response.status_code == 200:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, 'wb') as f:
+            f.write(response.content)
+        logger.info(f"Скачан файл {file_path} в {local_path}")
+    else:
+        raise Exception(f"Ошибка при скачивании {file_path}: {response.status_code}")
+
+def populate_embeddings_db(audio_folder, category_map=None, repo_url=None):
+    """Заполнение базы эмбеддингов из датасета с учетом структуры папок или GitHub."""
     if category_map is None:
         category_map = {}
     
-    db = load_embeddings_db()  # Загружаем существующую базу
-    audio_folder = Path(audio_folder)  # Используем Path для кроссплатформенности
-    
-    if not audio_folder.exists():
-        logger.error(f"Папка {audio_folder} не существует")
-        raise FileNotFoundError(f"Папка {audio_folder} не найдена")
+    db = load_embeddings_db()
+    audio_folder = Path(audio_folder)
+    os.makedirs(audio_folder, exist_ok=True)
 
-    patterns = [str(audio_folder / "**" / f"*.{ext}") for ext in ALLOWED_EXTENSIONS]
-    for pattern in patterns:
-        for audio_file in glob.glob(pattern, recursive=True):
-            audio_path = Path(audio_file)
-            filename = audio_path.name
-            # Определяем категорию по имени подпапки
-            category = audio_path.parent.name if audio_path.parent.name in ["normal", "broken", "noise"] else "unknown"
-            
-            # Если есть category_map, используем его в приоритете
-            category = category_map.get(filename, category)
-            
-            # Простая классификация на основе имени файла, если категория не определена
-            if category == "unknown":
-                if "normal" in filename.lower():
-                    category = "normal"
-                elif "anomal" in filename.lower() or "broken" in filename.lower():
-                    category = "broken"
-                elif "noise" in filename.lower() or "rain" in filename.lower() or "gravel" in filename.lower():
-                    category = "noise"
-            
-            # Вычисляем эмбеддинг
-            emb = compute_embedding(audio_file)
-            if emb is not None:
-                db[filename] = {"embedding": emb, "category": category}
-                logger.info(f"Добавлен эмбеддинг для {filename} (категория: {category})")
+    if repo_url:
+        # Список файлов для скачивания с GitHub
+        files_to_download = [
+            ("audio_dataset/normal/fan_id00_normal_00000000.wav", "normal"),
+            ("audio_dataset/normal/engine_normal.wav", "normal"),
+            ("audio_dataset/broken/fan_id00_abnormal_00000000.wav", "broken"),
+            ("audio_dataset/noise/rain_noise.wav", "noise"),
+            ("audio_dataset/noise/gravel_driving.wav", "noise"),
+        ]
+        
+        for file_path, category in files_to_download:
+            local_path = audio_folder / Path(file_path).name
+            try:
+                download_file_from_github(repo_url, file_path, local_path)
+                emb = compute_embedding(local_path)
+                if emb is not None:
+                    filename = Path(file_path).name
+                    db[filename] = {"embedding": emb, "category": category_map.get(filename, category)}
+                    logger.info(f"Добавлен эмбеддинг для {filename} (категория: {category})")
+            except Exception as e:
+                logger.error(f"Ошибка обработки {file_path}: {str(e)}")
+    else:
+        if not audio_folder.exists():
+            logger.error(f"Папка {audio_folder} не существует")
+            raise FileNotFoundError(f"Папка {audio_folder} не найдена")
+
+        patterns = [str(audio_folder / "**" / f"*.{ext}") for ext in ALLOWED_EXTENSIONS]
+        for pattern in patterns:
+            for audio_file in glob.glob(pattern, recursive=True):
+                audio_path = Path(audio_file)
+                filename = audio_path.name
+                category = audio_path.parent.name if audio_path.parent.name in ["normal", "broken", "noise"] else "unknown"
+                
+                category = category_map.get(filename, category)
+                
+                if category == "unknown":
+                    if "normal" in filename.lower():
+                        category = "normal"
+                    elif "anomal" in filename.lower() or "broken" in filename.lower():
+                        category = "broken"
+                    elif "noise" in filename.lower() or "rain" in filename.lower() or "gravel" in filename.lower():
+                        category = "noise"
+                
+                emb = compute_embedding(audio_file)
+                if emb is not None:
+                    db[filename] = {"embedding": emb, "category": category}
+                    logger.info(f"Добавлен эмбеддинг для {filename} (категория: {category})")
     
     try:
         with open(EMBEDDINGS_DB, 'w') as f:
@@ -185,9 +217,7 @@ def upload_file():
         input_path = os.path.join(UPLOAD_FOLDER, filename)
         file.save(input_path)
 
-        # Вычисление эмбеддинга для цельного файла
         emb = compute_embedding(input_path)
-
         db = load_embeddings_db()
 
         global model
@@ -197,10 +227,8 @@ def upload_file():
         key = filename
         db[key] = {"embedding": emb, "category": "unknown"}
 
-        # Сравнение с предыдущими
         sims = find_similar_sounds(emb, db)
 
-        # Определение статуса
         if model is not None:
             new_emb = torch.tensor(emb, dtype=torch.float32)
             with torch.no_grad():
@@ -249,6 +277,7 @@ def download_file(filename):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "populate":
         audio_folder = sys.argv[2] if len(sys.argv) > 2 else "audio_dataset"
+        repo_url = sys.argv[3] if len(sys.argv) > 3 else None
         category_map = {
             "fan_id00_normal_00000000.wav": "normal",
             "fan_id00_abnormal_00000000.wav": "broken",
@@ -256,10 +285,8 @@ if __name__ == "__main__":
             "gravel_driving.wav": "noise",
             "engine_normal.wav": "normal"
         }
-        populate_embeddings_db(audio_folder, category_map)
+        populate_embeddings_db(audio_folder, category_map, repo_url)
         db = load_embeddings_db()
         train_model(db)
     else:
-        # Для разработки используйте debug=True, для продакшена - debug=False и запуск через gunicorn
-        # Пример запуска в продакшен: gunicorn -w 4 -b 0.0.0.0:5000 MVPEquipment6:app
         app.run(debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
